@@ -1,0 +1,1028 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0f0f1a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Пиксельный квест</title>
+<style>
+html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+ font-family:'Courier New',monospace;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+canvas{image-rendering:pixelated;image-rendering:crisp-edges;display:block;background:#0f0f1a}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+const VW = 400, VH = 225;
+function resize(){
+  c.width = VW; c.height = VH;
+  ctx.imageSmoothingEnabled = false;
+  const s = Math.min(innerWidth / VW, innerHeight / VH);
+  c.style.width = (VW * s) + 'px';
+  c.style.height = (VH * s) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+/* ============ AUDIO ============ */
+let AC = null, soundOn = true, musicOn = true, musicStep = 0;
+function audioInit(){
+  if(AC) return;
+  try { AC = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){}
+  if(AC && AC.state === 'suspended') AC.resume();
+}
+function tone(freq, dur, type, vol, slide){
+  if(!AC || !soundOn) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, AC.currentTime);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), AC.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.06, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  o.connect(g); g.connect(AC.destination);
+  o.start(); o.stop(AC.currentTime + dur);
+}
+const sfx = {
+  jump(){ tone(420,0.12,'square',0.05,280); },
+  coin(){ tone(880,0.05,'square',0.045); setTimeout(()=>tone(1320,0.08,'square',0.045),45); },
+  hurt(){ tone(220,0.2,'sawtooth',0.08,-140); },
+  swing(){ tone(640,0.06,'sawtooth',0.035,-320); },
+  hit(){ tone(160,0.08,'square',0.06,-70); },
+  buy(){ tone(660,0.08,'triangle',0.06); setTimeout(()=>tone(990,0.1,'triangle',0.06),70); },
+  blip(){ tone(540 + Math.random()*220, 0.028, 'square', 0.025); },
+  dead(){ tone(320,0.5,'sawtooth',0.09,-260); },
+  land(){ tone(180,0.05,'square',0.03,-40); }
+};
+const melody = [0,7,12,7, 3,10,15,10, 5,12,17,12, 3,10,15,10];
+const bassline = [0,0,3,3,5,5,3,3];
+setInterval(()=>{
+  if(!AC || !musicOn) return;
+  const root = 220;
+  const m = melody[musicStep % melody.length];
+  const b = bassline[musicStep % bassline.length];
+  tone(root * Math.pow(2, m/12), 0.24, 'triangle', 0.028);
+  if(musicStep % 2 === 0) tone((root/2) * Math.pow(2, b/12), 0.45, 'sine', 0.04);
+  musicStep++;
+}, 280);
+
+/* ============ INPUT ============ */
+const keys = {};
+const activePointers = new Map();
+let inputLock = 0;
+
+function getV(e){
+  const r = c.getBoundingClientRect();
+  return { x: (e.clientX - r.left)/r.width * VW, y: (e.clientY - r.top)/r.height * VH };
+}
+function inRect(p, r){ return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+
+c.addEventListener('contextmenu', e => e.preventDefault());
+c.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  audioInit();
+  const v = getV(e);
+  activePointers.set(e.pointerId, v);
+  handlePointerDown(v);
+});
+c.addEventListener('pointermove', e => {
+  if(activePointers.has(e.pointerId)) activePointers.set(e.pointerId, getV(e));
+});
+c.addEventListener('pointerup', e => activePointers.delete(e.pointerId));
+c.addEventListener('pointercancel', e => activePointers.delete(e.pointerId));
+
+addEventListener('keydown', e => {
+  audioInit();
+  keys[e.key.toLowerCase()] = true;
+  if([' ','arrowup','arrowdown','arrowleft','arrowright'].includes(e.key.toLowerCase())) e.preventDefault();
+  if(e.key === 'Escape') closeTop();
+  if(e.key === 'e' || e.key === 'Enter') tryInteract();
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+const btnLeft   = { x: 8,    y: 163, w: 48, h: 54 };
+const btnRight  = { x: 60,   y: 163, w: 48, h: 54 };
+const btnAttack = { x: VW-108, y: 163, w: 48, h: 54 };
+const btnJump   = { x: VW-56,  y: 155, w: 48, h: 62 };
+const menuPlayBtn  = { x: VW/2-75, y: 108, w: 150, h: 32 };
+const menuSoundBtn = { x: VW/2-76, y: 150, w: 72, h: 24 };
+const menuMusicBtn = { x: VW/2+4,  y: 150, w: 72, h: 24 };
+const restartBtn   = { x: VW/2-75, y: 145, w: 150, h: 30 };
+
+function anyPointerIn(r){
+  for(const p of activePointers.values()) if(inRect(p, r)) return true;
+  return false;
+}
+function readInput(){
+  input.left   = !!keys['arrowleft'] || !!keys['a'] || anyPointerIn(btnLeft);
+  input.right  = !!keys['arrowright'] || !!keys['d'] || anyPointerIn(btnRight);
+  input.jump   = !!keys[' '] || !!keys['w'] || !!keys['arrowup'] || anyPointerIn(btnJump);
+  input.attack = !!keys['j'] || !!keys['x'] || anyPointerIn(btnAttack);
+}
+const input = { left:false, right:false, jump:false, attack:false };
+
+/* ============ STATE ============ */
+const state = {
+  scene: 'menu',
+  camX: 0,
+  gold: 0,
+  hearts: 3,
+  maxHearts: 3,
+  kills: 0,
+  questDone: false,
+  upgrades: { doubleJump: false, speed: false, damage: 1 }
+};
+let shake = 0;
+
+/* ============ LEVEL ============ */
+const levelW = 2600;
+const plats = [];
+function P(x, y, w, h){ plats.push({ x, y, w, h }); }
+P(0,   190, 560, 40);
+P(600, 190, 520, 40);
+P(1160,190, 640, 40);
+P(1850,190, 750, 40);
+P(200, 150, 70, 8);
+P(320, 120, 70, 8);
+P(460, 150, 70, 8);
+P(700, 140, 60, 8);
+P(820, 110, 60, 8);
+P(940, 140, 60, 8);
+P(1250,150, 80, 8);
+P(1400,120, 80, 8);
+P(1550, 90, 80, 8);
+P(1700,120, 80, 8);
+P(2000,140, 80, 8);
+P(2150,110, 80, 8);
+P(2300,150, 80, 8);
+
+let coins = [];
+function resetCoins(){
+  coins = [];
+  const data = [
+    [150,172],[180,172],[210,140],[240,140],[270,140],
+    [340,110],[370,110],[400,110],
+    [480,140],[510,140],[540,140],
+    [620,172],[660,172],
+    [720,130],[750,130],[780,130],
+    [840,100],[870,100],
+    [960,130],[990,130],
+    [1060,172],[1100,172],
+    [1260,140],[1290,140],[1320,140],
+    [1420,110],[1450,110],[1480,110],
+    [1570,80],[1600,80],
+    [1720,110],[1750,110],
+    [1880,172],[1920,172],
+    [2020,130],[2050,130],[2080,130],
+    [2170,100],[2200,100],
+    [2320,140],[2350,140],
+    [2400,172],[2430,172],[2460,172]
+  ];
+  for(const [x,y] of data) coins.push({ x, y, taken: false, t: Math.random()*10 });
+}
+
+let enemies = [];
+function resetEnemies(){
+  enemies = [];
+  const data = [
+    { x:300, y:180, minX:280, maxX:400, hp:2, speed:0.55 },
+    { x:700, y:180, minX:620, maxX:800, hp:2, speed:0.5 },
+    { x:900, y:180, minX:850, maxX:1000, hp:2, speed:0.65 },
+    { x:1250,y:180, minX:1180,maxX:1350,hp:3, speed:0.55 },
+    { x:1500,y:180, minX:1450,maxX:1650,hp:3, speed:0.5 },
+    { x:2000,y:180, minX:1920,maxX:2100,hp:3, speed:0.75 },
+    { x:2300,y:180, minX:2250,maxX:2450,hp:4, speed:0.85 }
+  ];
+  for(const e of data) enemies.push({ ...e, w:14, h:10, vx:e.speed, alive:true, hitCd:0 });
+}
+
+const npcs = [
+  { id:'shop', x:420, y:170, w:16, h:20, name:'Торговец', type:'shop',
+    lines:['Привет, путник!','У меня есть кое-что полезное.','Загляни в мой магазин!'] },
+  { id:'quest', x:1350, y:170, w:16, h:20, name:'Старейшина', type:'quest',
+    lines:['Слизни заполонили наши земли...','Убей пять слизней — и я заплачу.','Храбрости тебе, воин!'] },
+  { id:'end', x:2500, y:170, w:16, h:20, name:'Портал', type:'end',
+    lines:['Ты дошёл до конца...','Но это только начало.'] }
+];
+
+const player = {
+  x: 40, y: 170, w: 10, h: 14,
+  vx: 0, vy: 0, onGround: false, facing: 1,
+  jumps: 0, jumpHeld: false, attackHeld: false,
+  attackTimer: 0, attackCd: 0, invuln: 0,
+  safeX: 40, safeY: 170
+};
+
+let particles = [];
+function spawnParticles(x, y, color, n){
+  for(let i = 0; i < n; i++){
+    particles.push({
+      x, y, vx:(Math.random()-0.5)*3.5, vy:(Math.random()-0.5)*3.5 - 1,
+      life: 22, maxLife: 22, color
+    });
+  }
+}
+
+/* ============ COLLISION ============ */
+function overlap(ax, ay, aw, ah, bx, by, bw, bh){
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+function collidePlayer(){
+  const p = player;
+  for(const pl of plats){
+    if(overlap(p.x, p.y, p.w, p.h, pl.x, pl.y, pl.w, pl.h)){
+      if(p.vx > 0) p.x = pl.x - p.w;
+      else if(p.vx < 0) p.x = pl.x + pl.w;
+      p.vx = 0;
+    }
+  }
+  for(const pl of plats){
+    if(overlap(p.x, p.y, p.w, p.h, pl.x, pl.y, pl.w, pl.h)){
+      if(p.vy > 0){ p.y = pl.y - p.h; p.vy = 0; p.onGround = true; }
+      else if(p.vy < 0){ p.y = pl.y + pl.h; p.vy = 0; }
+    }
+  }
+}
+function attackBox(){
+  const p = player, range = 16;
+  return {
+    x: p.facing > 0 ? p.x + p.w : p.x - range,
+    y: p.y + 2, w: range, h: p.h - 4
+  };
+}
+
+/* ============ DIALOGUE & SHOP ============ */
+const dlg = { active: false, lines: [], idx: 0, chars: 0, name: '', after: null };
+function startDialogue(name, lines, after){
+  dlg.active = true; dlg.lines = lines; dlg.idx = 0;
+  dlg.chars = 0; dlg.name = name; dlg.after = after || null;
+  state.scene = 'dialogue';
+  inputLock = 18;
+}
+function advanceDialogue(){
+  if(inputLock > 0) return;
+  if(!dlg.lines.length) return;
+  const full = dlg.lines[dlg.idx].length;
+  if(dlg.chars < full){ dlg.chars = full; return; }
+  dlg.idx++;
+  dlg.chars = 0;
+  if(dlg.idx >= dlg.lines.length){
+    dlg.active = false;
+    state.scene = 'play';
+    const a = dlg.after; dlg.after = null;
+    inputLock = 12;
+    if(a) a();
+  }
+}
+
+const shopItems = [
+  { id:'heart',  name:'Сердце',        desc:'Макс. HP +1',        price:10 },
+  { id:'jump',   name:'Двойной прыжок',desc:'Прыжок в воздухе',   price:15 },
+  { id:'speed',  name:'Ботинки',       desc:'Быстрее бег',        price:12 },
+  { id:'damage', name:'Острый меч',    desc:'Урон +1',            price:20 }
+];
+let shopHitboxes = [];
+
+function isOwned(id){
+  if(id === 'heart')  return state.maxHearts >= 6;
+  if(id === 'jump')   return state.upgrades.doubleJump;
+  if(id === 'speed')  return state.upgrades.speed;
+  if(id === 'damage') return state.upgrades.damage > 1;
+  return false;
+}
+function openShop(){ state.scene = 'shop'; inputLock = 18; }
+function closeShop(){ state.scene = 'play'; inputLock = 12; }
+
+function buyItem(it){
+  if(inputLock > 0) return;
+  if(isOwned(it.id)) return;
+  if(state.gold < it.price) return;
+  state.gold -= it.price;
+  sfx.buy();
+  if(it.id === 'heart'){ state.maxHearts++; state.hearts = state.maxHearts; }
+  if(it.id === 'jump'){ state.upgrades.doubleJump = true; }
+  if(it.id === 'speed'){ state.upgrades.speed = true; }
+  if(it.id === 'damage'){ state.upgrades.damage++; }
+  spawnParticles(VW/2, 100, '#4ade80', 10);
+}
+
+function closeTop(){
+  if(state.scene === 'shop') closeShop();
+  else if(state.scene === 'dialogue'){ dlg.lines = ['']; dlg.idx = 0; dlg.chars = 1; advanceDialogue(); }
+}
+
+function nearNPC(){
+  let best = null, bd = 44;
+  for(const n of npcs){
+    const dx = (player.x + player.w/2) - (n.x + n.w/2);
+    const dy = (player.y + player.h/2) - (n.y + n.h/2);
+    const d = Math.hypot(dx, dy);
+    if(d < bd){ bd = d; best = n; }
+  }
+  return best;
+}
+function interactNPC(npc){
+  if(npc.type === 'shop'){
+    startDialogue(npc.name, npc.lines, openShop);
+  } else if(npc.type === 'quest'){
+    if(state.questDone){
+      startDialogue(npc.name, ['Ты уже помог нам!','Спасибо, герой.'], null);
+    } else if(state.kills >= 5){
+      startDialogue(npc.name, ['Ты победил пять слизней!','Вот твоя награда — 25 золота.'], () => {
+        state.gold += 25; state.questDone = true;
+        state.hearts = Math.min(state.hearts + 1, state.maxHearts);
+        spawnParticles(VW/2, 100, '#fbbf24', 14);
+      });
+    } else {
+      startDialogue(npc.name, ['Убей пять слизней.','Пока убито: ' + state.kills + '.'], null);
+    }
+  } else if(npc.type === 'end'){
+    startDialogue(npc.name, ['Ты дошёл до конца!','Но это только начало...'], () => {
+      state.scene = 'win';
+    });
+  }
+}
+function tryInteract(){
+  if(state.scene !== 'play') return;
+  const n = nearNPC();
+  if(n) interactNPC(n);
+}
+
+/* ============ POINTER DOWN ============ */
+function handlePointerDown(v){
+  if(state.scene === 'menu'){
+    if(inRect(v, menuPlayBtn)) startGame();
+    else if(inRect(v, menuSoundBtn)){ soundOn = !soundOn; if(soundOn) sfx.blip(); }
+    else if(inRect(v, menuMusicBtn)){ musicOn = !musicOn; }
+    return;
+  }
+  if(state.scene === 'dialogue'){ advanceDialogue(); return; }
+  if(state.scene === 'shop'){
+    for(const hb of shopHitboxes){
+      if(inRect(v, hb)){
+        if(hb.close) closeShop();
+        else if(hb.item) buyItem(hb.item);
+        return;
+      }
+    }
+    return;
+  }
+  if(state.scene === 'gameover' || state.scene === 'win'){
+    if(inRect(v, restartBtn)){ resetGame(); state.scene = 'play'; }
+    return;
+  }
+  if(state.scene === 'play'){
+    const wx = v.x + state.camX, wy = v.y;
+    for(const npc of npcs){
+      if(wx >= npc.x - 6 && wx <= npc.x + npc.w + 6 && wy >= npc.y - 26 && wy <= npc.y + npc.h + 6){
+        const d = Math.hypot((player.x+player.w/2)-(npc.x+npc.w/2),(player.y+player.h/2)-(npc.y+npc.h/2));
+        if(d < 46){ interactNPC(npc); return; }
+      }
+    }
+  }
+}
+
+/* ============ UPDATE ============ */
+function damage(amount){
+  if(player.invuln > 0) return;
+  state.hearts -= amount;
+  player.invuln = 60;
+  shake = 5;
+  sfx.hurt();
+  spawnParticles(player.x + player.w/2, player.y + player.h/2, '#ef4444', 8);
+  if(state.hearts <= 0){
+    state.hearts = 0;
+    state.scene = 'gameover';
+    sfx.dead();
+  }
+}
+function fallDeath(){
+  state.hearts--;
+  sfx.hurt();
+  if(state.hearts <= 0){
+    state.hearts = 0;
+    state.scene = 'gameover';
+    sfx.dead();
+  } else {
+    player.x = player.safeX; player.y = player.safeY;
+    player.vx = 0; player.vy = 0;
+    player.invuln = 60;
+  }
+}
+function updatePlayer(dt){
+  const p = player;
+  const speed = state.upgrades.speed ? 2.2 : 1.6;
+
+  if(input.left && !input.right){ p.vx = -speed; p.facing = -1; }
+  else if(input.right && !input.left){ p.vx = speed; p.facing = 1; }
+  else { p.vx *= 0.65; if(Math.abs(p.vx) < 0.1) p.vx = 0; }
+
+  const maxJumps = state.upgrades.doubleJump ? 2 : 1;
+  if(input.jump && !p.jumpHeld){
+    if(p.onGround || p.jumps < maxJumps){
+      if(!p.onGround && p.jumps < 1) p.jumps = 1;
+      p.vy = -4.2; p.jumps++; p.onGround = false;
+      sfx.jump();
+    }
+  }
+  p.jumpHeld = input.jump;
+
+  p.vy += 0.35 * dt;
+  if(p.vy > 7.5) p.vy = 7.5;
+
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+
+  p.onGround = false;
+  collidePlayer();
+  if(p.onGround){ p.jumps = 0; p.safeX = p.x; p.safeY = p.y - 2; }
+
+  p.attackCd -= dt;
+  if(input.attack && !p.attackHeld && p.attackCd <= 0){
+    p.attackTimer = 12; p.attackCd = 20;
+    sfx.swing();
+  }
+  p.attackHeld = input.attack;
+  if(p.attackTimer > 0) p.attackTimer -= dt;
+  if(p.invuln > 0) p.invuln -= dt;
+
+  if(p.y > 260){ fallDeath(); }
+}
+function updateEnemies(dt){
+  const ab = player.attackTimer > 0 ? attackBox() : null;
+  for(const e of enemies){
+    if(!e.alive) continue;
+    e.x += e.vx * dt;
+    if(e.x < e.minX){ e.x = e.minX; e.vx = Math.abs(e.vx); }
+    if(e.x + e.w > e.maxX){ e.x = e.maxX - e.w; e.vx = -Math.abs(e.vx); }
+
+    if(e.hitCd > 0) e.hitCd -= dt;
+
+    if(ab && e.hitCd <= 0 && overlap(e.x, e.y, e.w, e.h, ab.x, ab.y, ab.w, ab.h)){
+      e.hp -= state.upgrades.damage;
+      e.hitCd = 18;
+      sfx.hit();
+      spawnParticles(e.x + e.w/2, e.y + e.h/2, '#f472b6', 6);
+      if(e.hp <= 0){
+        e.alive = false;
+        state.kills++;
+        state.gold += 2;
+        sfx.coin();
+        spawnParticles(e.x + e.w/2, e.y + e.h/2, '#fbbf24', 10);
+      }
+    }
+
+    if(overlap(e.x, e.y, e.w, e.h, player.x, player.y, player.w, player.h) && player.invuln <= 0){
+      damage(1);
+      player.vx = (player.x < e.x ? -1 : 1) * 3;
+      player.vy = -2.6;
+    }
+  }
+}
+function updateCoins(dt){
+  const t = performance.now() * 0.006;
+  for(const c of coins){
+    if(c.taken) continue;
+    c.t += dt;
+    if(overlap(player.x, player.y, player.w, player.h, c.x - 3, c.y - 3, 6, 6)){
+      c.taken = true;
+      state.gold++;
+      sfx.coin();
+      spawnParticles(c.x, c.y, '#fbbf24', 5);
+    }
+  }
+}
+function updateParticles(dt){
+  for(let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 0.18 * dt;
+    p.life -= dt;
+    if(p.life <= 0) particles.splice(i, 1);
+  }
+}
+function updateCamera(dt){
+  const target = player.x - VW/2 + player.w/2;
+  state.camX += (target - state.camX) * 0.14 * dt;
+  state.camX = Math.max(0, Math.min(levelW - VW, state.camX));
+}
+function update(dt){
+  if(inputLock > 0) inputLock -= dt;
+  if(shake > 0) shake -= dt * 0.6;
+  readInput();
+
+  if(state.scene === 'menu') return;
+  if(state.scene === 'dialogue'){
+    if(dlg.active && dlg.lines[dlg.idx] && dlg.chars < dlg.lines[dlg.idx].length){
+      dlg.chars += 0.7 * dt;
+      if(dlg.chars >= dlg.lines[dlg.idx].length) dlg.chars = dlg.lines[dlg.idx].length;
+      if(Math.random() < 0.25) sfx.blip();
+    }
+    return;
+  }
+  if(state.scene !== 'play') return;
+
+  updatePlayer(dt);
+  updateEnemies(dt);
+  updateCoins(dt);
+  updateParticles(dt);
+  updateCamera(dt);
+}
+
+/* ============ RENDER ============ */
+function drawStars(){
+  const t = performance.now() * 0.001;
+  for(let i = 0; i < 60; i++){
+    const baseX = (i * 137.5) % VW;
+    const sx = (baseX - state.camX * 0.15) % VW;
+    const px = sx < 0 ? sx + VW : sx;
+    const py = (i * 53) % 120;
+    const tw = 0.3 + 0.5 * Math.abs(Math.sin(t + i));
+    ctx.fillStyle = 'rgba(255,255,255,' + tw.toFixed(2) + ')';
+    ctx.fillRect(Math.floor(px), Math.floor(py), 1, 1);
+  }
+}
+function drawMountains(){
+  ctx.fillStyle = '#1a1630';
+  const off = state.camX * 0.35;
+  for(let i = 0; i < 12; i++){
+    const bx = i * 200 - off;
+    if(bx > VW + 200 || bx < -200) continue;
+    ctx.beginPath();
+    ctx.moveTo(bx, 200);
+    ctx.lineTo(bx + 100, 90);
+    ctx.lineTo(bx + 200, 200);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.fillStyle = '#211a3a';
+  const off2 = state.camX * 0.55;
+  for(let i = 0; i < 16; i++){
+    const bx = i * 150 - off2;
+    if(bx > VW + 150 || bx < -150) continue;
+    ctx.beginPath();
+    ctx.moveTo(bx, 200);
+    ctx.lineTo(bx + 75, 130);
+    ctx.lineTo(bx + 150, 200);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+function drawPlatforms(){
+  for(const p of plats){
+    if(p.x + p.w < state.camX - 10 || p.x > state.camX + VW + 10) continue;
+    ctx.fillStyle = '#3b2e22';
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.fillStyle = '#5a4632';
+    ctx.fillRect(p.x, p.y, p.w, 3);
+    if(p.h > 20){
+      ctx.fillStyle = '#4ade80';
+      ctx.fillRect(p.x, p.y - 2, p.w, 2);
+      ctx.fillStyle = '#22c55e';
+      ctx.fillRect(p.x, p.y - 3, p.w, 1);
+    }
+  }
+}
+function drawCoin(x, y, t){
+  const w = 5 + Math.sin(t * 3 + x * 0.1) * 1.5;
+  ctx.fillStyle = '#b45309';
+  ctx.fillRect(x - 3, y - 3, 6, 6);
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillRect(x - w/2, y - 2, w, 5);
+  ctx.fillStyle = '#fde68a';
+  ctx.fillRect(x - w/4, y - 1, w/2, 2);
+}
+function drawCoins(){
+  for(const c of coins){
+    if(c.taken) continue;
+    if(c.x < state.camX - 10 || c.x > state.camX + VW + 10) continue;
+    drawCoin(c.x, c.y, c.t);
+  }
+}
+function drawEnemy(e){
+  if(!e.alive) return;
+  const bob = Math.sin(performance.now() * 0.008 + e.x) * 1;
+  const x = Math.round(e.x), y = Math.round(e.y + bob);
+  ctx.fillStyle = '#7f1d1d';
+  ctx.fillRect(x, y + 3, e.w, e.h - 3);
+  ctx.fillStyle = e.hp > 2 ? '#f472b6' : '#ef4444';
+  ctx.fillRect(x + 1, y, e.w - 2, e.h - 3);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(x + 3, y + 3, 2, 2);
+  ctx.fillRect(x + e.w - 5, y + 3, 2, 2);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x + 3 + (e.vx > 0 ? 1 : 0), y + 3, 1, 2);
+  ctx.fillRect(x + e.w - 5 + (e.vx > 0 ? 1 : 0), y + 3, 1, 2);
+}
+function drawEnemies(){
+  for(const e of enemies){
+    if(!e.alive) continue;
+    if(e.x + e.w < state.camX - 20 || e.x > state.camX + VW + 20) continue;
+    drawEnemy(e);
+  }
+}
+function drawNPC(n){
+  if(n.x < state.camX - 30 || n.x > state.camX + VW + 30) return;
+  const x = Math.round(n.x), y = Math.round(n.y);
+  if(n.type === 'shop'){
+    ctx.fillStyle = '#7c3aed';
+    ctx.fillRect(x - 2, y - 2, n.w + 4, n.h + 2);
+    ctx.fillStyle = '#a78bfa';
+    ctx.fillRect(x, y, n.w, n.h);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(x - 2, y - 6, n.w + 4, 4);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x + 4, y + 7, 2, 2);
+    ctx.fillRect(x + n.w - 6, y + 7, 2, 2);
+  } else if(n.type === 'quest'){
+    ctx.fillStyle = '#78350f';
+    ctx.fillRect(x, y, n.w, n.h);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(x + 2, y + 2, n.w - 4, 3);
+    ctx.fillStyle = '#fde68a';
+    ctx.fillRect(x + 4, y + 8, n.w - 8, 4);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x + 4, y + 9, 2, 2);
+    ctx.fillRect(x + n.w - 6, y + 9, 2, 2);
+  } else {
+    ctx.fillStyle = '#1e40af';
+    ctx.fillRect(x - 3, y - 3, n.w + 6, n.h + 6);
+    ctx.fillStyle = '#3b82f6';
+    ctx.fillRect(x, y, n.w, n.h);
+    const t = performance.now() * 0.006;
+    ctx.fillStyle = '#93c5fd';
+    ctx.fillRect(x + 4 + Math.sin(t)*2, y + 6, 3, 3);
+    ctx.fillRect(x + n.w - 7 + Math.sin(t)*2, y + 6, 3, 3);
+  }
+  // "!" indicator
+  const near = nearNPC();
+  if(near === n){
+    const t = performance.now() * 0.005;
+    const by = -8 + Math.sin(t) * 2;
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('!', x + n.w/2, y + by);
+  }
+}
+function drawNPCs(){
+  for(const n of npcs) drawNPC(n);
+}
+function drawPlayer(){
+  const p = player;
+  if(p.invuln > 0 && Math.floor(p.invuln / 4) % 2 === 0) return;
+  const x = Math.round(p.x), y = Math.round(p.y);
+  // cloak
+  ctx.fillStyle = '#1d4ed8';
+  ctx.fillRect(x, y + 4, p.w, p.h - 4);
+  // body
+  ctx.fillStyle = '#e5e7eb';
+  ctx.fillRect(x + 1, y + 7, p.w - 2, 5);
+  // head
+  ctx.fillStyle = '#cbd5e1';
+  ctx.fillRect(x + 1, y, p.w - 2, 7);
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillRect(x + 2, y - 1, p.w - 4, 2);
+  // eye
+  ctx.fillStyle = '#000';
+  if(p.facing > 0) ctx.fillRect(x + 5, y + 3, 2, 2);
+  else ctx.fillRect(x + 3, y + 3, 2, 2);
+  // sword
+  if(p.attackTimer > 0){
+    const prog = 1 - p.attackTimer / 12;
+    const sx = p.facing > 0 ? x + p.w - 2 : x - 12;
+    const sw = 14;
+    ctx.fillStyle = '#e5e7eb';
+    ctx.fillRect(p.facing > 0 ? sx : sx + sw - 12, y + 4, 12, 2);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillRect(p.facing > 0 ? sx + 10 : sx, y + 3, 2, 4);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(p.facing > 0 ? x + p.w : x - 16, y + 2, 16, p.h - 2);
+  }
+}
+function drawParticles(){
+  for(const p of particles){
+    const a = p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), 2, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawHeart(x, y, s, filled){
+  ctx.fillStyle = filled ? '#ef4444' : '#374151';
+  ctx.fillRect(x + s, y, s, s);
+  ctx.fillRect(x + s*5, y, s, s);
+  ctx.fillRect(x, y + s, s*7, s);
+  ctx.fillRect(x + s, y + s*2, s*5, s);
+  ctx.fillRect(x + s*2, y + s*3, s*3, s);
+  ctx.fillRect(x + s*3, y + s*4, s, s);
+}
+function drawHUD(){
+  for(let i = 0; i < state.maxHearts; i++){
+    drawHeart(8 + i*16, 8, 2, i < state.hearts);
+  }
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('● ' + state.gold, 8, 26);
+
+  if(!state.questDone){
+    ctx.fillStyle = '#9ca3af';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('Слизни: ' + Math.min(state.kills, 5) + '/5', VW - 8, 26);
+  } else {
+    ctx.fillStyle = '#4ade80';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('✓ Квест выполнен', VW - 8, 26);
+  }
+}
+function drawBtn(b, label){
+  const active = anyPointerIn(b);
+  ctx.fillStyle = active ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.13)';
+  ctx.strokeStyle = active ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(b.x + b.w/2, b.y + b.h/2, b.w/2, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, b.x + b.w/2, b.y + b.h/2 + 1);
+}
+function drawTouchControls(){
+  ctx.globalAlpha = 0.85;
+  drawBtn(btnLeft, '◀');
+  drawBtn(btnRight, '▶');
+  drawBtn(btnAttack, '⚔');
+  drawBtn(btnJump, '▲');
+  ctx.globalAlpha = 1;
+}
+function wrapText(text, x, y, maxW, lineH){
+  const words = text.split(' ');
+  let line = '', ly = y;
+  for(const w of words){
+    const test = line + w + ' ';
+    if(ctx.measureText(test).width > maxW && line){
+      ctx.fillText(line, x, ly);
+      line = w + ' ';
+      ly += lineH;
+    } else line = test;
+  }
+  if(line) ctx.fillText(line, x, ly);
+}
+function drawDialogue(){
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(0, VH - 72, VW, 72);
+  ctx.strokeStyle = '#fbbf24';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, VH - 71.5, VW - 1, 71);
+
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(dlg.name, 12, VH - 66);
+
+  const line = dlg.lines[dlg.idx] || '';
+  const shown = line.substring(0, Math.floor(dlg.chars));
+  ctx.fillStyle = '#fff';
+  ctx.font = '10px monospace';
+  wrapText(shown, 12, VH - 50, VW - 24, 13);
+
+  if(dlg.chars >= line.length && Math.floor(performance.now()/400) % 2 === 0){
+    ctx.fillStyle = '#fbbf24';
+    ctx.textAlign = 'right';
+    ctx.fillText('▼', VW - 12, VH - 18);
+  }
+}
+function drawShop(){
+  ctx.fillStyle = 'rgba(0,0,0,0.88)';
+  ctx.fillRect(0, 0, VW, VH);
+
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 16px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('★ МАГАЗИН ★', VW/2, 18);
+
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = '10px monospace';
+  ctx.fillText('● Золото: ' + state.gold, VW/2, 40);
+
+  shopHitboxes = [];
+  const startY = 58, rowH = 30;
+  for(let i = 0; i < shopItems.length; i++){
+    const it = shopItems[i];
+    const y = startY + i * rowH;
+    const owned = isOwned(it.id);
+    const canBuy = !owned && state.gold >= it.price;
+
+    ctx.fillStyle = owned ? '#111827' : (canBuy ? '#0f2a1e' : '#2a1414');
+    ctx.fillRect(16, y, VW - 32, rowH - 4);
+    ctx.strokeStyle = owned ? '#374151' : (canBuy ? '#4ade80' : '#7f1d1d');
+    ctx.lineWidth = 1;
+    ctx.strokeRect(16.5, y + 0.5, VW - 33, rowH - 5);
+
+    ctx.fillStyle = owned ? '#4b5563' : '#fff';
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 10px monospace';
+    ctx.fillText(it.name, 24, y + 6);
+    ctx.font = '8px monospace';
+    ctx.fillStyle = owned ? '#4b5563' : '#9ca3af';
+    ctx.fillText(it.desc, 24, y + 18);
+
+    ctx.textAlign = 'right';
+    if(owned){
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText('✓', VW - 26, y + 10);
+    } else {
+      ctx.fillStyle = canBuy ? '#fbbf24' : '#ef4444';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText(it.price + 'g', VW - 26, y + 10);
+    }
+    shopHitboxes.push({ x:16, y, w: VW-32, h: rowH-4, item: it });
+  }
+
+  ctx.fillStyle = '#3b82f6';
+  ctx.fillRect(VW/2 - 55, VH - 32, 110, 22);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('ЗАКРЫТЬ', VW/2, VH - 22);
+  shopHitboxes.push({ x: VW/2 - 55, y: VH - 32, w: 110, h: 22, close: true });
+}
+function drawOverlay(title, sub){
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0, 0, VW, VH);
+
+  ctx.fillStyle = title === 'ПОБЕДА!' ? '#4ade80' : '#ef4444';
+  ctx.font = 'bold 26px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(title, VW/2, 70);
+
+  ctx.fillStyle = '#9ca3af';
+  ctx.font = '10px monospace';
+  ctx.fillText(sub, VW/2, 100);
+
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText('Золото: ' + state.gold + '  •  Слизней: ' + state.kills, VW/2, 120);
+
+  ctx.fillStyle = '#3b82f6';
+  ctx.fillRect(restartBtn.x, restartBtn.y, restartBtn.w, restartBtn.h);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 12px monospace';
+  ctx.fillText('ИГРАТЬ СНОВА', VW/2, restartBtn.y + restartBtn.h/2 + 1);
+}
+function drawMenu(){
+  const t = performance.now() * 0.001;
+
+  ctx.fillStyle = '#0f0f1a';
+  ctx.fillRect(0, 0, VW, VH);
+
+  for(let i = 0; i < 50; i++){
+    const x = (i * 97 + Math.sin(t + i) * 20) % VW;
+    const y = (i * 53 + t * 10) % VH;
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.2 + 0.3 * Math.abs(Math.sin(t*2 + i))) + ')';
+    ctx.fillRect(x, y, 1, 1);
+  }
+
+  ctx.fillStyle = '#1e1a2e';
+  ctx.beginPath();
+  ctx.moveTo(0, VH);
+  for(let x = 0; x <= VW; x += 20){
+    ctx.lineTo(x, VH - 30 - Math.sin(x * 0.03 + t) * 8);
+  }
+  ctx.lineTo(VW, VH);
+  ctx.fill();
+
+  const bob = Math.sin(t * 2) * 3;
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 24px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('ПИКСЕЛЬНЫЙ', VW/2, 55 + bob);
+  ctx.fillStyle = '#3b82f6';
+  ctx.font = 'bold 20px monospace';
+  ctx.fillText('КВЕСТ', VW/2, 80 + bob);
+
+  ctx.fillStyle = '#3b82f6';
+  ctx.fillRect(menuPlayBtn.x, menuPlayBtn.y, menuPlayBtn.w, menuPlayBtn.h);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px monospace';
+  ctx.fillText('▶ ИГРАТЬ', VW/2, menuPlayBtn.y + menuPlayBtn.h/2 + 1);
+
+  const sCol = soundOn ? '#4ade80' : '#6b7280';
+  ctx.fillStyle = sCol;
+  ctx.fillRect(menuSoundBtn.x, menuSoundBtn.y, menuSoundBtn.w, menuSoundBtn.h);
+  ctx.fillStyle = '#000';
+  ctx.font = 'bold 9px monospace';
+  ctx.fillText('ЗВУК ' + (soundOn?'ВКЛ':'ВЫКЛ'), menuSoundBtn.x + menuSoundBtn.w/2, menuSoundBtn.y + menuSoundBtn.h/2 + 1);
+
+  const mCol = musicOn ? '#a78bfa' : '#6b7280';
+  ctx.fillStyle = mCol;
+  ctx.fillRect(menuMusicBtn.x, menuMusicBtn.y, menuMusicBtn.w, menuMusicBtn.h);
+  ctx.fillStyle = '#000';
+  ctx.fillText('МУЗЫКА ' + (musicOn?'ВКЛ':'ВЫКЛ'), menuMusicBtn.x + menuMusicBtn.w/2, menuMusicBtn.y + menuMusicBtn.h/2 + 1);
+
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '8px monospace';
+  ctx.fillText('Управление: свайп-кнопки внизу', VW/2, VH - 30);
+  ctx.fillText('Тапни NPC для диалога', VW/2, VH - 18);
+}
+
+function render(){
+  ctx.fillStyle = '#0f0f1a';
+  ctx.fillRect(0, 0, VW, VH);
+
+  if(state.scene === 'menu'){ drawMenu(); return; }
+
+  drawStars();
+  drawMountains();
+
+  const sx = shake > 0 ? (Math.random() - 0.5) * shake : 0;
+  const sy = shake > 0 ? (Math.random() - 0.5) * shake : 0;
+
+  ctx.save();
+  ctx.translate(Math.round(-state.camX + sx), Math.round(sy));
+
+  drawPlatforms();
+  drawCoins();
+  drawNPCs();
+  drawEnemies();
+  drawParticles();
+  drawPlayer();
+
+  ctx.restore();
+
+  const grad = ctx.createLinearGradient(0, VH - 40, 0, VH);
+  grad.addColorStop(0, 'rgba(15,15,26,0)');
+  grad.addColorStop(1, 'rgba(15,15,26,0.6)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, VH - 40, VW, 40);
+
+  drawHUD();
+  if(state.scene === 'play') drawTouchControls();
+
+  if(state.scene === 'dialogue') drawDialogue();
+  if(state.scene === 'shop') drawShop();
+  if(state.scene === 'gameover') drawOverlay('ИГРА ОКОНЧЕНА', 'Соберись с силами и попробуй снова');
+  if(state.scene === 'win') drawOverlay('ПОБЕДА!', 'Ты прошёл игру. Спасибо за игру!');
+}
+
+/* ============ GAME FLOW ============ */
+function startGame(){
+  resetGame();
+  state.scene = 'play';
+  audioInit();
+}
+function resetGame(){
+  state.gold = 0;
+  state.hearts = 3;
+  state.maxHearts = 3;
+  state.kills = 0;
+  state.questDone = false;
+  state.upgrades = { doubleJump: false, speed: false, damage: 1 };
+  state.camX = 0;
+  player.x = 40; player.y = 170;
+  player.vx = 0; player.vy = 0;
+  player.facing = 1;
+  player.jumps = 0;
+  player.invuln = 0;
+  player.attackTimer = 0;
+  player.attackCd = 0;
+  player.safeX = 40; player.safeY = 170;
+  particles = [];
+  resetCoins();
+  resetEnemies();
+  inputLock = 15;
+}
+
+/* ============ MAIN LOOP ============ */
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now - last) / 16.667, 3);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+resetCoins();
+resetEnemies();
+requestAnimationFrame(loop);
+</script>
+</body>
+  </html>
